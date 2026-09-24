@@ -78,9 +78,17 @@ jobs:
             arch_label: linux-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
+      # Check out OUR branch (tuned/ + this workflow live only here), then
+      # overlay the upstream tag's tree on top. `checkout -- .` only touches
+      # paths that exist in FETCH_HEAD, so tuned/ and .github/ (which don't
+      # exist at any upstream tag) survive untouched.
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          ref: ${{ needs.check.outputs.tag }}
+      - name: Overlay upstream source at target tag
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/sqlite/sqlite.git
+          git fetch --depth 1 upstream "${{ needs.check.outputs.tag }}"
+          git checkout FETCH_HEAD -- .
       - name: Build
         run: tuned/build.sh
       - name: Package
