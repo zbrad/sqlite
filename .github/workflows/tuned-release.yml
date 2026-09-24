@@ -1,0 +1,113 @@
+name: Tuned Release
+
+# Builds libsqlite3 + the sqlite3 CLI from upstream source (tuned/build.sh,
+# tuned/package.sh) and publishes a GitHub Release with the binaries, for
+# the WAL-reset-bug fix (>=3.51.3) that this fork's system libsqlite3 build
+# lacked -- see hermes-agent project memory "project_py314_local_build" for
+# the consumer side. Runs daily, auto-detects the newest upstream version-*
+# tag this fork hasn't released yet, and builds it for linux-aarch64 (GB10
+# Spark hosts) and linux-x86_64. Also runnable by hand with a specific tag.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (e.g. version-3.53.4). Leave empty to auto-detect the newest unreleased one."
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - name: Determine target version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG_INPUT: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/sqlite/sqlite.git
+          git fetch upstream --tags --quiet
+
+          if [ -n "${UPSTREAM_TAG_INPUT:-}" ]; then
+            TAG="$UPSTREAM_TAG_INPUT"
+          else
+            # "vesion-3.45.1" is a real historical typo tag upstream shipped;
+            # excluded explicitly rather than by pattern so a future correctly
+            # spelled 3.45.x tag still matches.
+            TAG="$(git tag -l 'version-*' | grep -vx 'vesion-3.45.1' | sort -V | tail -1)"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "No upstream version-* tag found" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#version-}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already released, nothing to do"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            arch_label: linux-aarch64
+          - runner: ubuntu-24.04
+            arch_label: linux-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+      - name: Build
+        run: tuned/build.sh
+      - name: Package
+        id: pkg
+        run: tuned/package.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sqlite-${{ needs.check.outputs.version }}-${{ matrix.arch_label }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "v${{ needs.check.outputs.version }}" dist/*.tar.gz dist/*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SQLite ${{ needs.check.outputs.version }} (tuned)" \
+            --notes "Built from upstream tag ${{ needs.check.outputs.tag }} (github.com/sqlite/sqlite) via tuned/build.sh: \`--all\` (FTS4, FTS5, RTree) + JSON1 (on by default), stripped, \`-O2 -DNDEBUG\`. Each tarball ships \`lib/libsqlite3.so.0\` (the real soname), \`bin/sqlite3\`, and headers."
